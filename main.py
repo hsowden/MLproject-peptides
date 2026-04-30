@@ -15,6 +15,7 @@ import numpy as np
 
 from src.utils.seed import set_seed
 from src.utils.io_utils import load_features, load_labels
+# Config constants: file paths for all intermediate and output files
 from src.config import (
     TRAIN_FASTA, TEST_FASTA,
     TRAIN_PARSED, TEST_PARSED,
@@ -27,6 +28,7 @@ from src.config import (
 
 
 def step_parse():
+    # Imports are local so this step's dependencies don't block other steps from running
     from src.parser import parse_fasta, records_to_csv, build_class_summary
     from src.evaluation.plots import (plot_class_distribution,
                                       plot_amino_acid_frequency,
@@ -34,11 +36,14 @@ def step_parse():
     print("\n[1/5] Parsing FASTA files...")
     train = parse_fasta(TRAIN_FASTA)
     test  = parse_fasta(TEST_FASTA)
+    # Write parsed records to CSV for use by downstream steps
     records_to_csv(train, TRAIN_PARSED)
     records_to_csv(test,  TEST_PARSED)
+    # Summary table of class counts across train and test splits
     build_class_summary(train, test, TRAIN_PARSED.parent / "class_summary.csv")
     train_df = pd.DataFrame(train, columns=["id", "label", "sequence"])
     test_df  = pd.DataFrame(test,  columns=["id", "label", "sequence"])
+    # Exploratory figures saved to figures/ for report
     plot_class_distribution(train_df, label_col="label", title="Train Class Distribution",
                             filename="class_distribution_train.png")
     plot_class_distribution(test_df,  label_col="label", title="Test Class Distribution",
@@ -62,20 +67,24 @@ def step_features():
     test_df  = pd.read_csv(TEST_PARSED)
 
     print("\n[2/5] Extracting physicochemical features...")
+    # Physicochemical: properties like charge, hydrophobicity, molecular weight
     build_physchem_features(train_df).to_csv(TRAIN_PHYSCHEM, index=False)
     build_physchem_features(test_df).to_csv(TEST_PHYSCHEM,  index=False)
 
     print("Extracting sequence-based features...")
+    # Sequence-based: k-mer counts, amino acid composition, etc.
     build_sequence_features(train_df).to_csv(TRAIN_SEQ, index=False)
     build_sequence_features(test_df).to_csv(TEST_SEQ,  index=False)
 
     print("Extracting PLM embeddings (may take a while)...")
+    # PLM: protein language model embeddings — deep learned representations of sequences
     tokenizer, model = load_model()
     device = get_device()
     np.save(TRAIN_PLM, embed_sequences(train_df["sequence"].tolist(), tokenizer, model, device=device))
     np.save(TEST_PLM,  embed_sequences(test_df["sequence"].tolist(),  tokenizer, model, device=device))
 
     print("Fusing features...")
+    # Concatenate all three feature types into one unified feature matrix per split
     fuse(TRAIN_PHYSCHEM, TRAIN_SEQ, TRAIN_PLM).to_csv(TRAIN_FUSED, index=False)
     fuse(TEST_PHYSCHEM,  TEST_SEQ,  TEST_PLM).to_csv(TEST_FUSED,  index=False)
 
@@ -93,6 +102,7 @@ def step_train_classical():
     print("\n[3/5] Training classical models...")
     train_df = pd.read_csv(TRAIN_PARSED)
     test_df  = pd.read_csv(TEST_PARSED)
+    # Encode string labels to integers consistently across train and test
     train_df, test_df, le = encode_labels(train_df, test_df)
 
     X_train = load_features(TRAIN_FUSED)
@@ -101,26 +111,30 @@ def step_train_classical():
     y_test  = test_df["label_enc"].values
     feature_names = list(pd.read_csv(TRAIN_FUSED).columns)
 
+    # t-SNE visualisation of the fused feature space before training
     plot_tsne(X_train, y_train, class_names=list(le.classes_),
               title="t-SNE of Fused Features (Train)", filename="tsne_train.png")
 
     all_results = []
+    # Train each classical model in sequence using the same train/test splits
     for fn in [train_knn, train_svm, train_nb, train_rf, train_bagging]:
         res, model = fn(X_train, y_train, X_test, y_test)
         all_results.append((res, model))
-        # Feature importance for RF
+        # RF exposes feature importances — extract and plot for the report
         if fn is train_rf:
             importances = get_feature_importances(model, feature_names)
             plot_feature_importance(importances, top_n=20, model_name="RandomForest")
 
+    # Run unified evaluation: prints metrics, saves confusion matrices, ROC curves, CSV
     evaluate_all(all_results, class_names=le.classes_)
 
-    # Model comparison chart (raw arrays already popped by evaluate_all)
+    # Raw arrays already popped by evaluate_all; safe to pass to comparison chart
     clean_results = [res for res, _ in all_results]
     plot_model_comparison(clean_results, filename="model_comparison_classical.png")
 
 
 def step_train_cnn():
+    # Trains the CNN and produces all CNN output files
     from src.models.train_cnn import train_cnn
     from src.evaluation.metrics import print_metrics
     from src.evaluation.plots import plot_confusion_matrix, plot_roc_curves
@@ -130,23 +144,29 @@ def step_train_cnn():
     train_df = pd.read_csv(TRAIN_PARSED)
     test_df  = pd.read_csv(TEST_PARSED)
 
+    # train_cnn returns metrics dict, trained model, and label encoder
     results, model, le = train_cnn(
         train_df["sequence"].tolist(), train_df["label"].values,
         test_df["sequence"].tolist(),  test_df["label"].values,
     )
     print_metrics(results)
 
+    # Pop raw arrays so they don't end up in the saved CSV
     y_true = results.pop("_y_true", None)
     y_pred = results.pop("_y_pred", None)
     y_prob = results.pop("_y_prob", None)
 
     if y_true is not None and y_pred is not None:
+        # Save confusion_matrix_cnn.png to figures/
         plot_confusion_matrix(y_true, y_pred, list(le.classes_), model_name="CNN")
 
+    # ROC curve only valid for binary classification with probability output
     if y_prob is not None and y_prob.ndim == 2 and y_prob.shape[1] == 2:
         fpr, tpr, _ = roc_curve(y_true, y_prob[:, 1])
+        # Plot CNN ROC curve on its own (separate from classical models' combined chart)
         plot_roc_curves([(fpr, tpr, "CNN")])
 
+    # Save cleaned metrics dict (no raw arrays) to tables/deep_model_results.csv
     out = TABLES / "deep_model_results.csv"
     out.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame([results]).to_csv(out, index=False)
@@ -155,13 +175,15 @@ def step_train_cnn():
 
 def main():
     parser = argparse.ArgumentParser(description="Peptide Toxicity Pipeline")
+    # --steps accepts one or more step names; "all" runs everything in order
     parser.add_argument("--steps", nargs="+",
                         choices=["parse", "features", "classical", "cnn", "all"],
                         default=["all"])
     args = parser.parse_args()
+    # Expand "all" into the full ordered list of steps
     steps = args.steps if "all" not in args.steps else ["parse", "features", "classical", "cnn"]
 
-    set_seed()
+    set_seed()  # Global random seed for reproducibility across all models
     if "parse"     in steps: step_parse()
     if "features"  in steps: step_features()
     if "classical" in steps: step_train_classical()
@@ -170,4 +192,5 @@ def main():
 
 
 if __name__ == "__main__":
+    # Only runs when executed directly (python main.py), not when imported as a module
     main()
